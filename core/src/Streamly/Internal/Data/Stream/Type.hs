@@ -81,6 +81,7 @@ module Streamly.Internal.Data.Stream.Type
     -- * Mapping
     , map
     , mapM
+    , parBuffered'
 
     -- * Stateful Filters
     , take
@@ -182,7 +183,7 @@ import Control.Monad.Catch (MonadThrow, throwM)
 import Control.Monad.Trans.Class (MonadTrans(lift))
 import Control.Monad.IO.Class (MonadIO(..))
 import Data.Foldable (Foldable(foldl'), fold, foldr)
-import Data.Functor (($>))
+import Data.Functor (($>), (<&>))
 import Data.Functor.Identity (Identity(..))
 #if __GLASGOW_HASKELL__ >= 810
 import Data.Kind (Type)
@@ -193,6 +194,7 @@ import Fusion.Plugin.Types (Fuse(..))
 import GHC.Base (build)
 import GHC.Exts (IsList(..), IsString(..), oneShot)
 import GHC.Types (SPEC(..))
+import Numeric.Natural (Natural)
 import Prelude hiding
     (head, map, mapM, take, concatMap, takeWhile, zipWith, concat, splitAt)
 import Text.Read
@@ -212,6 +214,10 @@ import qualified Streamly.Internal.Data.Fold.Type as FL hiding (foldr)
 import qualified Streamly.Internal.Data.StreamK.Type as K
 import qualified Streamly.Internal.Data.Unfold.Type as Unfold
 
+import qualified Effectful as Eff
+import qualified Effectful.Concurrent as Eff
+import qualified Effectful.Concurrent.STM as Eff
+
 #include "DocTestDataStream.hs"
 
 ------------------------------------------------------------------------------
@@ -224,6 +230,33 @@ import qualified Streamly.Internal.Data.Unfold.Type as Unfold
 -- current state, and the current state.
 data Stream m a =
     forall s. UnStream (State K.StreamK m a -> s -> m (Step s a)) s
+
+parBuffered'
+  :: Eff.Concurrent Eff.:> es
+  => Natural
+  -> Stream (Eff.Eff es) a
+  -> Stream (Eff.Eff es) a
+parBuffered' maxElems (Stream step state) = Stream step1 (Right state)
+ where
+
+  step1 gst (Right st) = do
+    buffer <- Eff.atomically $ Eff.newTBQueue maxElems -- Create a buffer/queue.
+    _      <- Eff.forkIO $ do                          -- In a separate thread fill the buffer:
+      let go st' = do
+            nextElem <- step gst st'                     -- Execute the step function.
+            Eff.atomically $ Eff.writeTBQueue buffer nextElem -- Insert the next element into buffer.
+            case nextElem of
+              Stop         -> pure ()                    -- No more elements, thread finished.
+              Skip    st'' -> go st''                    -- Continue with updated state.
+              Yield _ st'' -> go st''                    -- Continue with updated state.
+      go st
+    step1 gst $ Left buffer                            -- Listen for elements in main thread.
+
+  step1 _ (Left buffer) =
+    Eff.atomically (Eff.readTBQueue buffer) <&> \case -- Read the next element from the queue.
+      Stop      -> Stop
+      Skip    _ -> Skip    $ Left buffer
+      Yield a _ -> Yield a $ Left buffer
 
 -- XXX This causes perf trouble when pattern matching with "Stream"  in a
 -- recursive way, e.g. in uncons, foldBreak, concatMap. We need to get rid of
